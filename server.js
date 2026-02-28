@@ -22,7 +22,6 @@ app.get("/", (req, res) => {
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
-
 // =======================
 // MongoDB Access Logging
 // =======================
@@ -30,6 +29,36 @@ app.use(express.json({ limit: "50mb" }));
 // Nếu cần "deviceName" thì user tự nhập hoặc bạn tự đặt trên UI.
 
 app.set("trust proxy", true); // để lấy IP thật khi chạy sau proxy/nginx
+
+function getClientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  return (
+    (typeof xff === "string" && xff.split(",")[0].trim()) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    ""
+  );
+}
+
+// Gom theo "IP mạng"
+// - IPv4: gom /24 => 192.168.1.23 -> 192.168.1.*
+// - IPv6: gom /64 (thô) => lấy 4 segment đầu -> xxxx:xxxx:xxxx:xxxx::/64
+function getNetworkKeyFromIp(ip) {
+  if (!ip) return "unknown";
+
+  // xử lý IPv6 mapped IPv4: ::ffff:192.168.1.23
+  const v4 = ip.includes("::ffff:") ? ip.split("::ffff:")[1] : ip;
+
+  // Nếu là IPv4
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(v4)) {
+    const parts = v4.split(".");
+    return `${parts[0]}.${parts[1]}.${parts[2]}.*`;
+  }
+
+  // Nếu là IPv6
+  const seg = ip.split(":").filter(Boolean);
+  return `${seg.slice(0, 4).join(":")}::/64`;
+}
 
 async function connectMongo() {
   const uri = process.env.MONGODB_URI;
@@ -48,6 +77,11 @@ async function connectMongo() {
   }
 }
 
+/**
+ * LEGACY (giữ lại để tương thích / tham khảo)
+ * Trước đây bạn log mỗi request 1 record (create).
+ * Giờ đã chuyển sang NetworkAgg (gộp theo IP mạng) ở dưới.
+ */
 const AccessLogSchema = new mongoose.Schema(
   {
     ts: { type: Date, default: Date.now, index: true },
@@ -82,38 +116,101 @@ const AccessLogSchema = new mongoose.Schema(
 const AccessLog =
   mongoose.models.AccessLog || mongoose.model("AccessLog", AccessLogSchema);
 
+/**
+ * NEW: Network Aggregate (gộp theo IP mạng)
+ */
+const NetworkAggSchema = new mongoose.Schema(
+  {
+    networkKey: { type: String, index: true }, // ví dụ 192.168.1.* hoặc ipv6 /64
+    ipSample: String, // lưu 1 ip mẫu gần nhất
+
+    firstSeen: { type: Date, default: Date.now, index: true },
+    lastSeen: { type: Date, default: Date.now, index: true },
+    hits: { type: Number, default: 0 },
+
+    // thống kê theo path
+    paths: {
+      type: Map,
+      of: Number,
+      default: {},
+    },
+
+    // thu thập UA (unique)
+    userAgents: { type: [String], default: [] },
+
+    // trạng thái request gần nhất
+    lastMethod: String,
+    lastStatus: Number,
+    lastDurationMs: Number,
+
+    // optional client info (cái mới nhất)
+    client: {
+      timezone: String,
+      platform: String,
+      language: String,
+      screen: { w: Number, h: Number },
+      deviceMemory: Number,
+      hardwareConcurrency: Number,
+      touch: Boolean,
+      deviceName: String,
+    },
+  },
+  { versionKey: false }
+);
+
+// TTL tự xóa sau 30 ngày (bạn có thể bỏ nếu muốn giữ lâu)
+NetworkAggSchema.index({ lastSeen: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 30 });
+
+const NetworkAgg =
+  mongoose.models.NetworkAgg || mongoose.model("NetworkAgg", NetworkAggSchema);
+
 // Log mọi request (audit nhẹ). Không log body/query để tránh nhạy cảm.
+// FIX: gộp theo IP mạng (networkKey) bằng updateOne + upsert
 app.use((req, res, next) => {
   const start = Date.now();
+
   res.on("finish", async () => {
     try {
       if (mongoose.connection?.readyState !== 1) return;
 
-      const xff = req.headers["x-forwarded-for"];
-      const ip =
-        (typeof xff === "string" && xff.split(",")[0].trim()) ||
-        req.ip ||
-        req.socket?.remoteAddress;
+      const ip = getClientIp(req);
+      const networkKey = getNetworkKeyFromIp(ip);
 
-      await AccessLog.create({
-        ip,
-        method: req.method,
-        path: req.originalUrl || req.url,
-        status: res.statusCode,
-        durationMs: Date.now() - start,
-        userAgent: req.headers["user-agent"],
-        referer: req.headers["referer"],
-        acceptLanguage: req.headers["accept-language"],
-      });
+      const durationMs = Date.now() - start;
+      const reqPath = req.originalUrl || req.url;
+      const ua = req.headers["user-agent"];
+      const now = new Date();
+
+      await NetworkAgg.updateOne(
+        { networkKey },
+        {
+          $setOnInsert: { firstSeen: now, networkKey },
+          $set: {
+            lastSeen: now,
+            ipSample: ip,
+            lastMethod: req.method,
+            lastStatus: res.statusCode,
+            lastDurationMs: durationMs,
+          },
+          $inc: {
+            hits: 1,
+            [`paths.${reqPath}`]: 1,
+          },
+          ...(ua ? { $addToSet: { userAgents: ua } } : {}),
+        },
+        { upsert: true }
+      );
     } catch (e) {
       // không làm sập request vì log
-      console.warn("log error:", e.message);
+      console.warn("network agg log error:", e.message);
     }
   });
+
   next();
 });
 
 // Client gửi thêm thông tin thiết bị (optional)
+// FIX: cũng gộp vào cùng record theo networkKey
 app.post("/telemetry/client", async (req, res) => {
   try {
     if (mongoose.connection?.readyState !== 1) {
@@ -121,32 +218,31 @@ app.post("/telemetry/client", async (req, res) => {
     }
 
     const body = req.body || {};
-    const xff = req.headers["x-forwarded-for"];
-    const ip =
-      (typeof xff === "string" && xff.split(",")[0].trim()) ||
-      req.ip ||
-      req.socket?.remoteAddress;
+    const ip = getClientIp(req);
+    const networkKey = getNetworkKeyFromIp(ip);
+    const now = new Date();
 
-    await AccessLog.create({
-      ip,
-      method: "CLIENT",
-      path: "telemetry",
-      status: 200,
-      durationMs: 0,
-      userAgent: req.headers["user-agent"],
-      referer: req.headers["referer"],
-      acceptLanguage: req.headers["accept-language"],
-      client: {
-        timezone: body.timezone,
-        platform: body.platform,
-        language: body.language,
-        screen: body.screen,
-        deviceMemory: body.deviceMemory,
-        hardwareConcurrency: body.hardwareConcurrency,
-        touch: body.touch,
-        deviceName: body.deviceName,
+    await NetworkAgg.updateOne(
+      { networkKey },
+      {
+        $setOnInsert: { firstSeen: now, networkKey },
+        $set: {
+          lastSeen: now,
+          ipSample: ip,
+          client: {
+            timezone: body.timezone,
+            platform: body.platform,
+            language: body.language,
+            screen: body.screen,
+            deviceMemory: body.deviceMemory,
+            hardwareConcurrency: body.hardwareConcurrency,
+            touch: body.touch,
+            deviceName: body.deviceName,
+          },
+        },
       },
-    });
+      { upsert: true }
+    );
 
     res.json({ success: true });
   } catch (e) {
@@ -184,7 +280,7 @@ const accounts = [
     cloud_name: process.env.CLOUD_NAME_4,
     api_key: process.env.CLOUD_API_KEY_4,
     api_secret: process.env.CLOUD_API_SECRET_4,
-  }
+  },
 ];
 
 const setCloudinaryConfig = (index) => {
@@ -208,7 +304,7 @@ const setCloudinaryConfig = (index) => {
 };
 
 async function backupFaceDBToCloud() {
-  console.log(">> [SYSTEM] Đang backup Face ID lên Cloudinary...");
+  console.log(">> [SYSTEM] Đang backup Face ID lên Cloudinary.");
 
   setCloudinaryConfig(0);
 
@@ -220,7 +316,7 @@ async function backupFaceDBToCloud() {
       resource_type: "raw",
       overwrite: true,
       folder: "system_backup",
-      invalidate: true, 
+      invalidate: true,
     });
     console.log(">> [SYSTEM] Backup Face ID thành công!");
   } catch (error) {
@@ -233,12 +329,10 @@ async function restoreFaceDBFromCloud() {
   setCloudinaryConfig(0);
 
   try {
-  
     const url = cloudinary.url("system_backup/" + FACE_DB_CLOUD_ID, {
       resource_type: "raw",
     });
 
- 
     const fetchUrl = `${url}?t=${new Date().getTime()}`;
     const response = await fetch(fetchUrl, { cache: "no-store" });
 
@@ -251,8 +345,8 @@ async function restoreFaceDBFromCloud() {
   } catch (error) {
     console.log(
       ">> [SYSTEM] ⚠️ Chưa có bản backup hoặc lỗi (" +
-        error.message +
-        "). ❌ Tạo Database rỗng."
+      error.message +
+      "). ❌ Tạo Database rỗng."
     );
 
     if (!fs.existsSync(FACE_DB_PATH)) {
@@ -271,7 +365,7 @@ app.get("/face-id/load", (req, res) => {
     res.json({ success: true, data: data });
   } catch (e) {
     console.error("Lỗi đọc DB:", e);
-    
+
     res.json({ success: true, data: [] });
   }
 });
@@ -284,7 +378,7 @@ app.post("/face-id/register", async (req, res) => {
     if (fs.existsSync(FACE_DB_PATH)) {
       try {
         users = JSON.parse(fs.readFileSync(FACE_DB_PATH));
-      } catch (e) {}
+      } catch (e) { }
     }
 
     users = users.filter((u) => u.label !== "Admin");
@@ -292,7 +386,6 @@ app.post("/face-id/register", async (req, res) => {
 
     fs.writeFileSync(FACE_DB_PATH, JSON.stringify(users, null, 2));
 
-  
     backupFaceDBToCloud();
 
     res.json({ success: true, message: "Đã lưu và đang đồng bộ lên Cloud!" });
@@ -356,9 +449,8 @@ app.get("/stats", async (req, res) => {
         total: limitCredits,
         percent: Math.min(100, Math.round((usedCredits / limitCredits) * 100)),
       };
-    } catch (e) {}
+    } catch (e) { }
 
-  
     res.json({
       success: true,
       totalFiles: totalFiles,
