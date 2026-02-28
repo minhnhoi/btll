@@ -23,10 +23,8 @@ app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
 // =======================
-// MongoDB Access Logging
+// MongoDB Access Logging (Trace-friendly)
 // =======================
-// NOTE: Trình duyệt web không cho lấy "tên máy tính/hostname" thật.
-// Nếu cần "deviceName" thì user tự nhập hoặc bạn tự đặt trên UI.
 
 app.set("trust proxy", true); // để lấy IP thật khi chạy sau proxy/nginx
 
@@ -38,6 +36,11 @@ function getClientIp(req) {
     req.socket?.remoteAddress ||
     ""
   );
+}
+
+function getForwardedForRaw(req) {
+  const xff = req.headers["x-forwarded-for"];
+  return typeof xff === "string" ? xff : "";
 }
 
 // Gom theo "IP mạng"
@@ -60,6 +63,10 @@ function getNetworkKeyFromIp(ip) {
   return `${seg.slice(0, 4).join(":")}::/64`;
 }
 
+function makeRequestId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 async function connectMongo() {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
@@ -78,26 +85,21 @@ async function connectMongo() {
 }
 
 /**
- * LEGACY (giữ lại để tương thích / tham khảo)
- * Trước đây bạn log mỗi request 1 record (create).
- * Giờ đã chuyển sang NetworkAgg (gộp theo IP mạng) ở dưới.
+ * LEGACY (giữ lại để tham khảo / tương thích)
+ * Trước đây log mỗi request 1 record (create).
+ * Giờ dùng NetworkAgg (gộp theo IP mạng + lưu rolling events) ở dưới.
  */
 const AccessLogSchema = new mongoose.Schema(
   {
     ts: { type: Date, default: Date.now, index: true },
-
-    // Server-collected
     ip: { type: String, index: true },
     method: String,
     path: String,
     status: Number,
     durationMs: Number,
-
     userAgent: String,
     referer: String,
     acceptLanguage: String,
-
-    // Optional: client-sent (không nhạy cảm)
     client: {
       timezone: String,
       platform: String,
@@ -106,44 +108,72 @@ const AccessLogSchema = new mongoose.Schema(
       deviceMemory: Number,
       hardwareConcurrency: Number,
       touch: Boolean,
-      // user-provided only (không phải hostname thật)
       deviceName: String,
     },
   },
   { versionKey: false }
 );
-
 const AccessLog =
   mongoose.models.AccessLog || mongoose.model("AccessLog", AccessLogSchema);
 
 /**
- * NEW: Network Aggregate (gộp theo IP mạng)
+ * NEW: Network Aggregate (gộp theo IP mạng) + phục vụ truy vết
  */
 const NetworkAggSchema = new mongoose.Schema(
   {
-    networkKey: { type: String, index: true }, // ví dụ 192.168.1.* hoặc ipv6 /64
-    ipSample: String, // lưu 1 ip mẫu gần nhất
+    // gộp theo mạng để thống kê
+    networkKey: { type: String, index: true },
+
+    // IP đầy đủ gần nhất + XFF raw (đối chiếu proxy)
+    lastIp: { type: String, index: true },
+    lastXff: String,
 
     firstSeen: { type: Date, default: Date.now, index: true },
     lastSeen: { type: Date, default: Date.now, index: true },
     hits: { type: Number, default: 0 },
 
     // thống kê theo path
-    paths: {
-      type: Map,
-      of: Number,
-      default: {},
-    },
+    paths: { type: Map, of: Number, default: {} },
 
-    // thu thập UA (unique)
+    // UA unique (để nhìn tổng quan)
     userAgents: { type: [String], default: [] },
 
-    // trạng thái request gần nhất
-    lastMethod: String,
-    lastStatus: Number,
-    lastDurationMs: Number,
+    // event gần nhất
+    lastEvent: {
+      ts: Date,
+      requestId: String,
+      ip: String,
+      xff: String,
+      method: String,
+      path: String,
+      status: Number,
+      durationMs: Number,
+      ua: String,
+      referer: String,
+      acceptLanguage: String,
+    },
 
-    // optional client info (cái mới nhất)
+    // rolling events gần nhất (giữ N event)
+    events: {
+      type: [
+        {
+          ts: Date,
+          requestId: String,
+          ip: String,
+          xff: String,
+          method: String,
+          path: String,
+          status: Number,
+          durationMs: Number,
+          ua: String,
+          referer: String,
+          acceptLanguage: String,
+        },
+      ],
+      default: [],
+    },
+
+    // optional client info (cái mới nhất từ /telemetry/client)
     client: {
       timezone: String,
       platform: String,
@@ -164,22 +194,43 @@ NetworkAggSchema.index({ lastSeen: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 30 
 const NetworkAgg =
   mongoose.models.NetworkAgg || mongoose.model("NetworkAgg", NetworkAggSchema);
 
-// Log mọi request (audit nhẹ). Không log body/query để tránh nhạy cảm.
-// FIX: gộp theo IP mạng (networkKey) bằng updateOne + upsert
+// Log mọi request (audit nhẹ). Không log body/query/auth/cookie.
 app.use((req, res, next) => {
   const start = Date.now();
+  const requestId = makeRequestId();
+
+  // trả requestId cho client để debug/support
+  res.setHeader("x-request-id", requestId);
 
   res.on("finish", async () => {
     try {
       if (mongoose.connection?.readyState !== 1) return;
 
       const ip = getClientIp(req);
+      const xffRaw = getForwardedForRaw(req);
       const networkKey = getNetworkKeyFromIp(ip);
 
       const durationMs = Date.now() - start;
       const reqPath = req.originalUrl || req.url;
-      const ua = req.headers["user-agent"];
+
+      const ua = req.headers["user-agent"] || "";
+      const referer = req.headers["referer"] || "";
+      const acceptLanguage = req.headers["accept-language"] || "";
       const now = new Date();
+
+      const event = {
+        ts: now,
+        requestId,
+        ip,
+        xff: xffRaw,
+        method: req.method,
+        path: reqPath,
+        status: res.statusCode,
+        durationMs,
+        ua,
+        referer,
+        acceptLanguage,
+      };
 
       await NetworkAgg.updateOne(
         { networkKey },
@@ -187,21 +238,25 @@ app.use((req, res, next) => {
           $setOnInsert: { firstSeen: now, networkKey },
           $set: {
             lastSeen: now,
-            ipSample: ip,
-            lastMethod: req.method,
-            lastStatus: res.statusCode,
-            lastDurationMs: durationMs,
+            lastIp: ip,
+            lastXff: xffRaw,
+            lastEvent: event,
           },
           $inc: {
             hits: 1,
             [`paths.${reqPath}`]: 1,
           },
           ...(ua ? { $addToSet: { userAgents: ua } } : {}),
+          $push: {
+            events: {
+              $each: [event],
+              $slice: -50, // giữ 50 event gần nhất
+            },
+          },
         },
         { upsert: true }
       );
     } catch (e) {
-      // không làm sập request vì log
       console.warn("network agg log error:", e.message);
     }
   });
@@ -210,7 +265,6 @@ app.use((req, res, next) => {
 });
 
 // Client gửi thêm thông tin thiết bị (optional)
-// FIX: cũng gộp vào cùng record theo networkKey
 app.post("/telemetry/client", async (req, res) => {
   try {
     if (mongoose.connection?.readyState !== 1) {
@@ -219,6 +273,7 @@ app.post("/telemetry/client", async (req, res) => {
 
     const body = req.body || {};
     const ip = getClientIp(req);
+    const xffRaw = getForwardedForRaw(req);
     const networkKey = getNetworkKeyFromIp(ip);
     const now = new Date();
 
@@ -228,7 +283,8 @@ app.post("/telemetry/client", async (req, res) => {
         $setOnInsert: { firstSeen: now, networkKey },
         $set: {
           lastSeen: now,
-          ipSample: ip,
+          lastIp: ip,
+          lastXff: xffRaw,
           client: {
             timezone: body.timezone,
             platform: body.platform,
@@ -345,8 +401,8 @@ async function restoreFaceDBFromCloud() {
   } catch (error) {
     console.log(
       ">> [SYSTEM] ⚠️ Chưa có bản backup hoặc lỗi (" +
-      error.message +
-      "). ❌ Tạo Database rỗng."
+        error.message +
+        "). ❌ Tạo Database rỗng."
     );
 
     if (!fs.existsSync(FACE_DB_PATH)) {
@@ -365,7 +421,6 @@ app.get("/face-id/load", (req, res) => {
     res.json({ success: true, data: data });
   } catch (e) {
     console.error("Lỗi đọc DB:", e);
-
     res.json({ success: true, data: [] });
   }
 });
@@ -378,7 +433,7 @@ app.post("/face-id/register", async (req, res) => {
     if (fs.existsSync(FACE_DB_PATH)) {
       try {
         users = JSON.parse(fs.readFileSync(FACE_DB_PATH));
-      } catch (e) { }
+      } catch (e) {}
     }
 
     users = users.filter((u) => u.label !== "Admin");
@@ -423,9 +478,7 @@ app.get("/stats", async (req, res) => {
 
     try {
       const checkResult = await cloudinary.search
-        .expression(
-          "resource_type:image OR resource_type:video OR resource_type:raw"
-        )
+        .expression("resource_type:image OR resource_type:video OR resource_type:raw")
         .max_results(1)
         .execute();
       totalFiles = checkResult.total_count;
@@ -449,7 +502,7 @@ app.get("/stats", async (req, res) => {
         total: limitCredits,
         percent: Math.min(100, Math.round((usedCredits / limitCredits) * 100)),
       };
-    } catch (e) { }
+    } catch (e) {}
 
     res.json({
       success: true,
@@ -482,9 +535,7 @@ app.post("/upload", upload.single("myFile"), async (req, res) => {
   const index = req.body.accountIndex || 0;
   const acc = setCloudinaryConfig(index);
   if (!acc)
-    return res
-      .status(500)
-      .json({ success: false, message: "Lỗi cấu hình server." });
+    return res.status(500).json({ success: false, message: "Lỗi cấu hình server." });
 
   const uploadStream = cloudinary.uploader.upload_stream(
     {
@@ -559,9 +610,7 @@ async function getFilesHandler(req, res, indexParam) {
 
   try {
     const result = await cloudinary.search
-      .expression(
-        "resource_type:image OR resource_type:video OR resource_type:raw"
-      )
+      .expression("resource_type:image OR resource_type:video OR resource_type:raw")
       .sort_by("created_at", "desc")
       .max_results(500)
       .execute();
@@ -601,14 +650,10 @@ app.delete("/admin/files/:index/:id", async (req, res) => {
     let result = await cloudinary.uploader.destroy(publicId);
 
     if (result.result !== "ok") {
-      result = await cloudinary.uploader.destroy(publicId, {
-        resource_type: "video",
-      });
+      result = await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
     }
     if (result.result !== "ok") {
-      result = await cloudinary.uploader.destroy(publicId, {
-        resource_type: "raw",
-      });
+      result = await cloudinary.uploader.destroy(publicId, { resource_type: "raw" });
     }
 
     if (result.result === "ok" || result.result === "not found") {
@@ -699,9 +744,7 @@ app.get("/admin/stats-all", async (req, res) => {
         });
 
         const checkCount = await cloudinary.search
-          .expression(
-            "resource_type:image OR resource_type:video OR resource_type:raw"
-          )
+          .expression("resource_type:image OR resource_type:video OR resource_type:raw")
           .max_results(1)
           .execute();
 
@@ -710,9 +753,7 @@ app.get("/admin/stats-all", async (req, res) => {
         let rawUsed = usageResult.credits?.usage || 0;
         const total = usageResult.plan_limits?.credits || 25;
 
-        if (realTotalFiles === 0) {
-          rawUsed = 0;
-        }
+        if (realTotalFiles === 0) rawUsed = 0;
 
         let used = Math.max(0, rawUsed);
         let finalPercent = parseFloat(((used / total) * 100).toFixed(2));
